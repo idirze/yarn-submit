@@ -1,0 +1,323 @@
+package com.dirze.yarn.submit;
+
+import com.google.common.base.Strings;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.yarn.api.records.*;
+import org.apache.log4j.Level;
+
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.*;
+
+public class MsgUtils {
+  public static final Msg.Empty EMPTY = Msg.Empty.newBuilder().build();
+
+  public static Msg.File.Type writeFileType(LocalResourceType typ) {
+    switch (typ) {
+      case FILE:
+        return Msg.File.Type.FILE;
+      case ARCHIVE:
+        return Msg.File.Type.ARCHIVE;
+      case PATTERN:
+        throw new IllegalArgumentException("Invalid resource type: " + typ);
+    }
+    return null; // appease the compiler, but can't get here
+  }
+
+  public static LocalResourceType readFileType(Msg.File.Type typ) {
+    switch (typ) {
+      case FILE:
+        return LocalResourceType.FILE;
+      case ARCHIVE:
+        return LocalResourceType.ARCHIVE;
+    }
+    return null; // appease the compiler, but can't get here
+  }
+
+  public static Msg.File.Visibility writeFileVisibility(LocalResourceVisibility vis) {
+    switch (vis) {
+      case PUBLIC:
+        return Msg.File.Visibility.PUBLIC;
+      case PRIVATE:
+        return Msg.File.Visibility.PRIVATE;
+      case APPLICATION:
+        return Msg.File.Visibility.APPLICATION;
+    }
+    return null; // appease the compiler, but can't get here
+  }
+
+  public static LocalResourceVisibility readFileVisibility(Msg.File.Visibility vis) {
+    switch (vis) {
+      case PUBLIC:
+        return LocalResourceVisibility.PUBLIC;
+      case PRIVATE:
+        return LocalResourceVisibility.PRIVATE;
+      case APPLICATION:
+        return LocalResourceVisibility.APPLICATION;
+    }
+    return null; // appease the compiler, but can't get here
+  }
+
+  public static long getResourceValue(Resource r, String s) {
+    Method method;
+    try {
+      method = Resource.class.getMethod("getResourceValue", String.class);
+    } catch (NoSuchMethodException exc) {
+      return 0;
+    }
+
+    try {
+      return (long) method.invoke(r, s);
+    } catch (InvocationTargetException exc) {
+      return 0;
+    } catch (IllegalAccessException exc) {
+      // This can never happen
+      throw new RuntimeException(
+          "Unexpected access exception accessing Resource.getResourceValue"
+      );
+    }
+  }
+
+  public static void setResourceValue(Resource r, String name, long value) {
+    Method method;
+    try {
+      method = Resource.class.getMethod("setResourceValue", String.class, long.class);
+    } catch (NoSuchMethodException exc) {
+      throw new Utils.UnsupportedFeatureException(
+          "Custom resources not supported in this version of Hadoop, "
+          + "can't set request for '" + name + "'"
+      );
+    }
+
+    try {
+      method.invoke(r, name, value);
+    } catch (InvocationTargetException exc) {
+      Throwable cause = exc.getCause();
+      throw new Utils.UnsupportedFeatureException(
+          "Resource '" + name + "' is not defined in your cluster's configuration"
+      );
+    } catch (IllegalAccessException exc) {
+      // This can never happen
+      throw new RuntimeException(
+          "Unexpected access exception accessing Resource.setResourceValue"
+      );
+    }
+  }
+
+  public static Resource readResources(Msg.Resources r) {
+    Resource out = Resource.newInstance(r.getMemory(), r.getVcores());
+    long gpus = r.getGpus();
+    if (gpus != 0) {
+      setResourceValue(out, "yarn.io/gpu", gpus);
+    }
+    long fpgas = r.getFpgas();
+    if (fpgas != 0) {
+      setResourceValue(out, "yarn.io/fpga", gpus);
+    }
+    return out;
+  }
+
+  public static Msg.Resources writeResources(Resource r) {
+    return Msg.Resources.newBuilder()
+      .setMemory(Math.max(0, r.getMemory()))
+      .setVcores(Math.max(0, r.getVirtualCores()))
+      .setGpus(getResourceValue(r, "yarn.io/gpu"))
+      .setFpgas(getResourceValue(r, "yarn.io/fpga"))
+      .build();
+  }
+
+
+  public static URL readUrl(Msg.Url url) {
+    return URL.newInstance(
+        url.getScheme(),
+        Strings.emptyToNull(url.getHost()),
+        url.getPort() == 0 ? -1 : url.getPort(),
+        url.getFile());
+  }
+
+  public static Msg.Url writeUrl(URL url) {
+    return Msg.Url.newBuilder()
+        .setScheme(url.getScheme())
+        .setHost(Strings.nullToEmpty(url.getHost()))
+        .setPort(url.getPort())
+        .setFile(url.getFile())
+        .build();
+  }
+
+  public static Msg.File writeFile(LocalResource r) {
+    return Msg.File.newBuilder()
+        .setSource(writeUrl(r.getResource()))
+        .setType(writeFileType(r.getType()))
+        .setVisibility(writeFileVisibility(r.getVisibility()))
+        .setSize(r.getSize())
+        .setTimestamp(r.getTimestamp())
+        .build();
+  }
+
+  public static LocalResource readFile(Msg.File f) {
+    return LocalResource.newInstance(
+        readUrl(f.getSource()),
+        readFileType(f.getType()),
+        readFileVisibility(f.getVisibility()),
+        f.getSize(),
+        f.getTimestamp());
+  }
+
+  public static Msg.Service writeService(Model.Service service) {
+    Msg.Service.Builder builder = Msg.Service.newBuilder()
+        .setInstances(service.getInstances())
+        .setNodeLabel(service.getNodeLabel())
+        .addAllNodes(service.getNodes())
+        .addAllRacks(service.getRacks())
+        .setRelaxLocality(service.getRelaxLocality())
+        .setMaxRestarts(service.getMaxRestarts())
+        .setAllowFailures(service.getAllowFailures())
+        .setResources(writeResources(service.getResources()))
+        .putAllEnv(service.getEnv())
+        .setScript(service.getScript());
+
+    for (Map.Entry<String, LocalResource> entry : service.getLocalResources().entrySet()) {
+      builder.putFiles(entry.getKey(), writeFile(entry.getValue()));
+    }
+    return builder.build();
+  }
+
+  public static Model.Service readService(Msg.Service service) {
+    Map<String, LocalResource> localResources = new HashMap<String, LocalResource>();
+    for (Map.Entry<String, Msg.File> entry : service.getFilesMap().entrySet()) {
+      localResources.put(entry.getKey(), readFile(entry.getValue()));
+    }
+    return new Model.Service(
+        service.getInstances(),
+        service.getNodeLabel(),
+        new ArrayList<String>(service.getNodesList()),
+        new ArrayList<String>(service.getRacksList()),
+        service.getRelaxLocality(),
+        service.getMaxRestarts(),
+        service.getAllowFailures(),
+        readResources(service.getResources()),
+        localResources,
+        new HashMap<String, String>(service.getEnvMap()),
+        service.getScript());
+  }
+
+  public static Msg.Log.Level writeLogLevel(Level logLevel) {
+    switch (logLevel.toInt()) {
+      case Level.INFO_INT:
+        return Msg.Log.Level.INFO;
+      case Level.ALL_INT:
+        return Msg.Log.Level.ALL;
+      case Level.TRACE_INT:
+        return Msg.Log.Level.TRACE;
+      case Level.DEBUG_INT:
+        return Msg.Log.Level.DEBUG;
+      case Level.WARN_INT:
+        return Msg.Log.Level.WARN;
+      case Level.ERROR_INT:
+        return Msg.Log.Level.ERROR;
+      case Level.FATAL_INT:
+        return Msg.Log.Level.FATAL;
+      case Level.OFF_INT:
+        return Msg.Log.Level.OFF;
+    }
+    return null; // appease the compiler, but can't get here
+  }
+
+  public static Level readLogLevel(Msg.Log.Level logLevel) {
+    switch (logLevel) {
+      case INFO:
+        return Level.INFO;
+      case ALL:
+        return Level.ALL;
+      case TRACE:
+        return Level.TRACE;
+      case DEBUG:
+        return Level.DEBUG;
+      case WARN:
+        return Level.WARN;
+      case ERROR:
+        return Level.ERROR;
+      case FATAL:
+        return Level.FATAL;
+      case OFF:
+        return Level.OFF;
+    }
+    return null; // appease the compiler, but can't get here
+  }
+
+  public static Msg.Master writeMaster(Model.Master master) {
+    Msg.Master.Builder builder = Msg.Master.newBuilder()
+        .setResources(writeResources(master.getResources()))
+        .putAllEnv(master.getEnv())
+        .setScript(master.getScript())
+        .setLogLevel(writeLogLevel(master.getLogLevel()));
+
+    for (Map.Entry<String, LocalResource> entry : master.getLocalResources().entrySet()) {
+      builder.putFiles(entry.getKey(), writeFile(entry.getValue()));
+    }
+
+    if (master.hasLogConfig()) {
+      builder.setLogConfig(writeFile(master.getLogConfig()));
+    }
+
+    return builder.build();
+  }
+
+  public static Model.Master readMaster(Msg.Master master) {
+    Model.Master out = new Model.Master();
+
+    Map<String, LocalResource> localResources = new HashMap<String, LocalResource>();
+    for (Map.Entry<String, Msg.File> entry : master.getFilesMap().entrySet()) {
+      localResources.put(entry.getKey(), readFile(entry.getValue()));
+    }
+    out.setLocalResources(localResources);
+    out.setResources(readResources(master.getResources()));
+    out.setEnv(new HashMap<String, String>(master.getEnvMap()));
+    out.setScript(master.getScript());
+
+    if (master.hasLogConfig()) {
+      out.setLogConfig(readFile(master.getLogConfig()));
+    }
+    out.setLogLevel(readLogLevel(master.getLogLevel()));
+    return out;
+  }
+
+  public static Msg.ApplicationSpec writeApplicationSpec(Model.ApplicationSpec spec) {
+    Msg.ApplicationSpec.Builder builder = Msg.ApplicationSpec.newBuilder()
+        .setName(spec.getName())
+        .setQueue(spec.getQueue())
+        .setUser(spec.getUser())
+        .setNodeLabel(spec.getNodeLabel())
+        .setMaxAttempts(spec.getMaxAttempts())
+        .addAllTags(spec.getTags())
+        .setMaster(writeMaster(spec.getMaster()));
+;
+    for (Map.Entry<String, Model.Service> entry : spec.getServices().entrySet()) {
+      builder.putServices(entry.getKey(), writeService(entry.getValue()));
+    }
+    return builder.build();
+  }
+
+  public static Model.ApplicationSpec readApplicationSpec(Msg.ApplicationSpec spec) {
+    Map<String, Model.Service> services = new HashMap<String, Model.Service>();
+    for (Map.Entry<String, Msg.Service> entry : spec.getServicesMap().entrySet()) {
+      services.put(entry.getKey(), readService(entry.getValue()));
+    }
+
+    final List<Path> fileSystems = new ArrayList<Path>();
+    for (int i = 0; i < spec.getFileSystemsCount(); i++) {
+      fileSystems.add(new Path(spec.getFileSystems(i)));
+    }
+
+    return new Model.ApplicationSpec(spec.getName(),
+                                     spec.getQueue(),
+                                     spec.getUser(),
+                                     spec.getNodeLabel(),
+                                     spec.getMaxAttempts(),
+                                     new HashSet<String>(spec.getTagsList()),
+                                     fileSystems,
+                                     readMaster(spec.getMaster()),
+                                     services);
+  }
+
+}
